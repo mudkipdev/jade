@@ -14,7 +14,7 @@ from .recipe import Clip
 
 type Command = tuple[int, list[str]]
 
-SECTION_COMMANDS = frozenset(("add", "speed", "volume", "mute", "compress"))
+SECTION_COMMANDS = frozenset(("add", "speed", "volume", "mute", "compress", "trim"))
 
 UNITS = {
     "b": 1,
@@ -28,6 +28,12 @@ UNITS = {
 
 
 def parse_time(value: str) -> Decimal:
+    units = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?", value, re.IGNORECASE)
+
+    if units is not None and any(part is not None for part in units.groups()):
+        hours, minutes, seconds = units.groups()
+        return Decimal(hours or 0) * 3600 + Decimal(minutes or 0) * 60 + Decimal(seconds or 0)
+
     parts = value.split(":")
 
     if not 1 <= len(parts) <= 3:

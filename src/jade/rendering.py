@@ -177,6 +177,9 @@ class Renderer:
         if section.speed != 1 or (self.use_audio and section.volume != 1):
             stitched = self.adjust_section(section, stitched, section_work)
 
+        if section.left_trim or section.right_trim:
+            stitched = self.trim_section(section, stitched, section_work)
+
         if section.compression_target is not None:
             return compress(
                 stitched, section.duration, section.compression_target, self.use_audio, section_work
@@ -231,6 +234,40 @@ class Renderer:
 
         run_ffmpeg([*command, str(adjusted)])
         return adjusted
+
+    def trim_section(self, section: Section, stitched: Path, section_work: Path) -> Path:
+        trimmed = section_work / "trimmed.mp4"
+        command = ["-i", str(stitched), "-ss", str(section.left_trim), "-t", str(section.duration)]
+        command += [
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+        ]
+
+        if self.use_audio:
+            command += [
+                "-map",
+                "0:a:0",
+                "-af",
+                "aresample=48000,apad",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-shortest",
+            ]
+        else:
+            command += ["-an"]
+
+        run_ffmpeg([*command, str(trimmed)])
+        return trimmed
 
 
 def compress(

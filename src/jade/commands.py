@@ -27,6 +27,7 @@ class RecipeBuilder:
             "volume": self.volume,
             "mute": self.mute,
             "compress": self.compress,
+            "trim": self.trim,
         }
 
     def build(self, commands: list[Command]) -> Recipe:
@@ -42,6 +43,7 @@ class RecipeBuilder:
 
     def build_section(self, commands: list[Command], stack: tuple[str, ...] = ()) -> Section:
         section = Section([])
+        trim_line = None
 
         for line_number, words in commands:
             try:
@@ -52,11 +54,17 @@ class RecipeBuilder:
                     raise ValueError(f"unknown command {name!r}")
 
                 handler(arguments, section, stack)
+
+                if name == "trim":
+                    trim_line = line_number
             except (OSError, ValueError) as error:
                 if re.match(r"^Line \d+: ", str(error)):
                     raise
 
                 raise ValueError(f"Line {line_number}: {error}") from error
+
+        if section.clips and section.duration <= 0:
+            raise ValueError(f"Line {trim_line}: trim removes the entire section")
 
         return section
 
@@ -156,3 +164,17 @@ class RecipeBuilder:
             raise ValueError("only one compress command is allowed per section")
 
         section.compression_target = parse_size(arguments[0])
+
+    def trim(self, arguments: list[str], section: Section, _stack: tuple[str, ...]) -> None:
+        if len(arguments) != 2 or arguments[0] not in ("left", "right"):
+            raise ValueError("expected 'trim left|right DURATION', such as 'trim right 1m'")
+
+        duration = parse_time(arguments[1])
+
+        if duration <= 0:
+            raise ValueError("trim duration must be positive")
+
+        if arguments[0] == "left":
+            section.left_trim += duration
+        else:
+            section.right_trim += duration

@@ -1,6 +1,10 @@
 # jade
 An interactive CLI video editor.
 
+## Requirements
+- ffmpeg
+- ffprobe
+
 ## Syntax
 ```
 gameplay:

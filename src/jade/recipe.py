@@ -35,10 +35,16 @@ class Section:
     speed: Decimal = Decimal(1)
     volume: Decimal = Decimal(1)
     compression_target: int | None = None
+    left_trim: Decimal = Decimal(0)
+    right_trim: Decimal = Decimal(0)
+
+    @property
+    def untrimmed_duration(self) -> Decimal:
+        return sum((item.duration for item in self.clips), Decimal(0)) / self.speed
 
     @property
     def duration(self) -> Decimal:
-        return sum((item.duration for item in self.clips), Decimal(0)) / self.speed
+        return self.untrimmed_duration - self.left_trim - self.right_trim
 
 
 @dataclass(frozen=True)
