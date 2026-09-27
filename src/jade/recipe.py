@@ -1,0 +1,47 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from decimal import Decimal
+from fractions import Fraction
+from pathlib import Path
+
+
+@dataclass(frozen=True)
+class Clip:
+    path: Path
+    duration: Decimal
+    width: int
+    height: int
+    fps: Fraction
+    has_audio: bool
+
+
+@dataclass(frozen=True)
+class TrimmedClip:
+    clip: Clip
+    start: Decimal | None = None
+    end: Decimal | None = None
+
+    @property
+    def duration(self) -> Decimal:
+        return (
+            self.clip.duration if self.start is None or self.end is None else self.end - self.start
+        )
+
+
+@dataclass
+class Section:
+    clips: list[TrimmedClip | Section]
+    speed: Decimal = Decimal(1)
+    volume: Decimal = Decimal(1)
+    compression_target: int | None = None
+
+    @property
+    def duration(self) -> Decimal:
+        return sum((item.duration for item in self.clips), Decimal(0)) / self.speed
+
+
+@dataclass(frozen=True)
+class Recipe:
+    root_section: Section
+    output_path: Path
