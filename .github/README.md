@@ -8,10 +8,16 @@ An interactive CLI video editor.
 ## Syntax
 ```
 gameplay:
-    add "~/Videos/2026-09-27_09-44-20.mp4" 03:30 03:45
-    add "~/Videos/2026-09-27_09-39-48.mp4" 06:40 06:50
+    add "~/Videos/2026-09-27_09-39-48.mp4" 03:30 03:45
+    add "~/Videos/2026-09-27_09-44-20.mp4" 06:40 06:50
     speed 2x
     mute
+    add music
+
+audio music:
+    add "~/Music/intense.mp3"
+    trim right 2s
+    volume 50%
 
 add gameplay
 add "~/Videos/outro.mp4"

@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from decimal import Decimal
 from pathlib import Path
 
-from .recipe import Recipe, Section, TrimmedClip
+from .recipe import AudioSection, Recipe, Section, TrimmedAudio, TrimmedClip, TrimmedSection
 
 
 def run_ffmpeg(arguments: list[str]) -> None:
@@ -42,7 +42,17 @@ def iter_trimmed_clips(section: Section) -> Iterator[TrimmedClip]:
         if isinstance(item, TrimmedClip):
             yield item
         else:
-            yield from iter_trimmed_clips(item)
+            yield from iter_trimmed_clips(
+                item.section if isinstance(item, TrimmedSection) else item
+            )
+
+
+def has_overlays(section: Section) -> bool:
+    return bool(section.overlays) or any(
+        has_overlays(item.section if isinstance(item, TrimmedSection) else item)
+        for item in section.clips
+        if isinstance(item, Section | TrimmedSection)
+    )
 
 
 class Renderer:
@@ -54,7 +64,9 @@ class Renderer:
         height = first.height + first.height % 2
 
         self.output_fps = str(first.fps)
-        self.use_audio = any(trimmed_clip.clip.has_audio for trimmed_clip in trimmed_clips)
+        self.use_audio = has_overlays(recipe.root_section) or any(
+            trimmed_clip.clip.has_audio for trimmed_clip in trimmed_clips
+        )
         self.video_filter = (
             f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
@@ -151,6 +163,10 @@ class Renderer:
             if isinstance(item, TrimmedClip):
                 segment = section_work / f"segment_{index:04d}.mp4"
                 self.render_clip(item, segment)
+            elif isinstance(item, TrimmedSection):
+                child = self.render_section(item.section, work)
+                segment = section_work / f"segment_{index:04d}.mp4"
+                self.trim_video(child, item.start, item.duration, segment)
             else:
                 segment = self.render_section(item, work)
             relative = os.path.relpath(segment, section_work)
@@ -180,12 +196,155 @@ class Renderer:
         if section.left_trim or section.right_trim:
             stitched = self.trim_section(section, stitched, section_work)
 
+        if section.overlays:
+            stitched = self.overlay_section(section, stitched, section_work, work)
+
         if section.compression_target is not None:
             return compress(
                 stitched, section.duration, section.compression_target, self.use_audio, section_work
             )
 
         return stitched
+
+    def render_audio_section(self, section: AudioSection, work: Path) -> Path:
+        self.section_count += 1
+        section_work = work / f"audio_{self.section_count:04d}"
+        section_work.mkdir()
+        entries = []
+
+        for index, item in enumerate(section.clips):
+            if isinstance(item, TrimmedAudio):
+                segment = section_work / f"segment_{index:04d}.wav"
+                command = []
+
+                if item.start is not None:
+                    command += ["-ss", str(item.start), "-t", str(item.duration)]
+
+                command += [
+                    "-i",
+                    str(item.clip.path),
+                    "-map",
+                    "0:a:0",
+                    "-vn",
+                    "-af",
+                    "aresample=48000",
+                    "-ac",
+                    "2",
+                    "-ar",
+                    "48000",
+                    "-c:a",
+                    "pcm_s16le",
+                    str(segment),
+                ]
+
+                run_ffmpeg(command)
+            else:
+                segment = self.render_audio_section(item, work)
+
+            entries.append(f"file '{os.path.relpath(segment, section_work)}'")
+
+        concat_file = section_work / "concat.txt"
+        concat_file.write_text("\n".join(entries) + "\n", encoding="utf-8")
+        stitched = section_work / "stitched.wav"
+
+        run_ffmpeg(
+            ["-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(stitched)]
+        )
+
+        if (
+            section.speed == 1
+            and section.volume == 1
+            and not (section.left_trim or section.right_trim)
+        ):
+            return stitched
+
+        filters = []
+
+        if section.speed != 1:
+            filters.extend(audio_speed_filter(section.speed))
+
+        if section.volume != 1:
+            filters.append(f"volume={section.volume}")
+
+        if section.left_trim or section.right_trim:
+            filters.append(
+                f"atrim=start={section.left_trim}:end={section.left_trim + section.duration}"
+            )
+
+            filters.append("asetpts=PTS-STARTPTS")
+
+        adjusted = section_work / "adjusted.wav"
+
+        run_ffmpeg(
+            [
+                "-i",
+                str(stitched),
+                "-af",
+                ",".join(filters),
+                "-ac",
+                "2",
+                "-ar",
+                "48000",
+                "-c:a",
+                "pcm_s16le",
+                str(adjusted),
+            ]
+        )
+
+        return adjusted
+
+    def overlay_section(
+        self, section: Section, stitched: Path, section_work: Path, work: Path
+    ) -> Path:
+        command = ["-i", str(stitched)]
+        filters = []
+        labels = ["[0:a:0]"]
+
+        for index, overlay in enumerate(section.overlays, 1):
+            audio = self.render_audio_section(overlay.section, work)
+            command += ["-i", str(audio)]
+            delay = int(overlay.start * 1000)
+            label = f"overlay{index}"
+
+            duration = (
+                section.duration - overlay.start
+                if overlay.end is None
+                else overlay.end - overlay.start
+            )
+
+            filters.append(f"[{index}:a:0]atrim=duration={duration},adelay={delay}:all=1[{label}]")
+            labels.append(f"[{label}]")
+
+        filters.append(
+            f"{''.join(labels)}amix=inputs={len(labels)}:duration=first:"
+            "dropout_transition=0:normalize=0,apad[mixed]"
+        )
+
+        mixed = section_work / "mixed.mp4"
+
+        command += [
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "copy",
+            "-map",
+            "[mixed]",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ac",
+            "2",
+            "-ar",
+            "48000",
+            "-shortest",
+            str(mixed),
+        ]
+
+        run_ffmpeg(command)
+        return mixed
 
     def adjust_section(self, section: Section, stitched: Path, section_work: Path) -> Path:
         adjusted = section_work / "adjusted.mp4"
@@ -237,7 +396,11 @@ class Renderer:
 
     def trim_section(self, section: Section, stitched: Path, section_work: Path) -> Path:
         trimmed = section_work / "trimmed.mp4"
-        command = ["-i", str(stitched), "-ss", str(section.left_trim), "-t", str(section.duration)]
+        self.trim_video(stitched, section.left_trim, section.duration, trimmed)
+        return trimmed
+
+    def trim_video(self, source: Path, start: Decimal, duration: Decimal, output: Path) -> None:
+        command = ["-i", str(source), "-ss", str(start), "-t", str(duration)]
         command += [
             "-map",
             "0:v:0",
@@ -266,8 +429,7 @@ class Renderer:
         else:
             command += ["-an"]
 
-        run_ffmpeg([*command, str(trimmed)])
-        return trimmed
+        run_ffmpeg([*command, str(output)])
 
 
 def compress(

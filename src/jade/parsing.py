@@ -10,11 +10,13 @@ from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from pathlib import Path
 
-from .recipe import Clip
+from .recipe import AudioClip, Clip
 
 type Command = tuple[int, list[str]]
+type SectionDefinition = tuple[str, list[Command]]
 
-SECTION_COMMANDS = frozenset(("add", "speed", "volume", "mute", "compress", "trim"))
+VIDEO_COMMANDS = frozenset(("add", "speed", "volume", "mute", "compress", "trim"))
+AUDIO_COMMANDS = frozenset(("add", "speed", "volume", "mute", "trim"))
 
 UNITS = {
     "b": 1,
@@ -146,8 +148,48 @@ def probe_clip(path: Path) -> Clip:
     )
 
 
-def parse_recipe(recipe: str) -> tuple[dict[str, list[Command]], list[Command]]:
-    sections: dict[str, list[Command]] = {}
+def probe_audio(path: Path) -> AudioClip:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration:stream=codec_type,duration",
+            "-of",
+            "json",
+            str(path),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    if result.returncode:
+        raise ValueError(f"Cannot read {path}: {result.stderr.strip()}")
+
+    data = json.loads(result.stdout)
+    audio = next(
+        (stream for stream in data.get("streams", []) if stream.get("codec_type") == "audio"),
+        None,
+    )
+
+    if audio is None:
+        raise ValueError(f"No audio stream in {path}")
+
+    try:
+        duration = Decimal(data.get("format", {}).get("duration") or audio["duration"])
+    except (KeyError, InvalidOperation, TypeError) as error:
+        raise ValueError(f"Missing audio duration in {path}") from error
+
+    if not duration.is_finite() or duration <= 0:
+        raise ValueError(f"Invalid audio duration in {path}")
+
+    return AudioClip(path, duration)
+
+
+def parse_recipe(recipe: str) -> tuple[dict[str, SectionDefinition], list[Command]]:
+    sections: dict[str, SectionDefinition] = {}
     commands: list[Command] = []
     current_section = None
 
@@ -162,22 +204,29 @@ def parse_recipe(recipe: str) -> tuple[dict[str, list[Command]], list[Command]]:
 
         indented = line[0].isspace()
 
-        if not indented and len(words) == 1 and words[0].endswith(":"):
-            name = words[0][:-1]
+        if (
+            not indented
+            and words[-1].endswith(":")
+            and (len(words) == 1 or (len(words) == 2 and words[0] == "audio"))
+        ):
+            kind = "audio" if len(words) == 2 else "video"
+            name = words[-1][:-1]
 
             if not name or name in sections:
                 raise ValueError(f"Line {line_number}: invalid or duplicate section name {name!r}")
 
-            sections[name] = []
+            sections[name] = (kind, [])
             current_section = name
         elif indented:
             if current_section is None:
                 raise ValueError(f"Line {line_number}: indented command outside a section")
 
-            if words[0] not in SECTION_COMMANDS:
+            kind, section_commands = sections[current_section]
+
+            if words[0] not in (AUDIO_COMMANDS if kind == "audio" else VIDEO_COMMANDS):
                 raise ValueError(f"Line {line_number}: unknown section command {words[0]!r}")
 
-            sections[current_section].append((line_number, words))
+            section_commands.append((line_number, words))
         else:
             current_section = None
             commands.append((line_number, words))

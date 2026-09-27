@@ -5,14 +5,34 @@ from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
 
-from .parsing import Command, parse_factor, parse_size, parse_time, probe_clip
-from .recipe import Clip, Recipe, Section, TrimmedClip
+from .parsing import (
+    Command,
+    SectionDefinition,
+    parse_factor,
+    parse_size,
+    parse_time,
+    probe_audio,
+    probe_clip,
+)
+from .recipe import (
+    AudioClip,
+    AudioOverlay,
+    AudioSection,
+    Clip,
+    Recipe,
+    Section,
+    TrimmedAudio,
+    TrimmedClip,
+    TrimmedSection,
+)
+
+type EditableSection = Section | AudioSection
 
 
 class RecipeBuilder:
     def __init__(
         self,
-        sections: dict[str, list[Command]],
+        sections: dict[str, SectionDefinition],
         base_directory: Path,
     ) -> None:
         self.sections = sections
@@ -20,6 +40,7 @@ class RecipeBuilder:
         self.output_path: Path | None = None
         self.save_seen = False
         self.clip_cache: dict[Path, Clip] = {}
+        self.audio_cache: dict[Path, AudioClip] = {}
         self.handlers: dict[str, Callable[[list[str], Section, tuple[str, ...]], None]] = {
             "save": self.save,
             "add": self.add,
@@ -27,6 +48,15 @@ class RecipeBuilder:
             "volume": self.volume,
             "mute": self.mute,
             "compress": self.compress,
+            "trim": self.trim,
+        }
+        self.audio_handlers: dict[
+            str, Callable[[list[str], AudioSection, tuple[str, ...]], None]
+        ] = {
+            "add": self.add_audio,
+            "speed": self.speed,
+            "volume": self.volume,
+            "mute": self.mute,
             "trim": self.trim,
         }
 
@@ -66,20 +96,57 @@ class RecipeBuilder:
         if section.clips and section.duration <= 0:
             raise ValueError(f"Line {trim_line}: trim removes the entire section")
 
+        if any(
+            overlay.end is not None and overlay.end > section.duration
+            for overlay in section.overlays
+        ):
+            raise ValueError("audio placement ends after the section")
+
         return section
 
-    def clip_for(self, reference: str) -> Clip:
-        path = Path(reference).expanduser()
+    def build_audio_section(self, commands: list[Command], stack: tuple[str, ...]) -> AudioSection:
+        section = AudioSection([])
+        trim_line = None
 
+        for line_number, words in commands:
+            try:
+                name, arguments = words[0], words[1:]
+                handler = self.audio_handlers[name]
+                handler(arguments, section, stack)
+                if name == "trim":
+                    trim_line = line_number
+            except (KeyError, OSError, ValueError) as error:
+                if re.match(r"^Line \d+: ", str(error)):
+                    raise
+                raise ValueError(f"Line {line_number}: {error}") from error
+
+        if not section.clips:
+            raise ValueError(f"audio section {stack[-1]!r} contains no clips")
+        if section.duration <= 0:
+            raise ValueError(f"Line {trim_line}: trim removes the entire section")
+        return section
+
+    def resolve_path(self, reference: str) -> Path:
+        path = Path(reference).expanduser()
         if not path.is_absolute():
             path = self.base_directory / path
+        return path.resolve(strict=True)
 
-        path = path.resolve(strict=True)
+    def clip_for(self, reference: str) -> Clip:
+        path = self.resolve_path(reference)
 
         if path not in self.clip_cache:
             self.clip_cache[path] = probe_clip(path)
 
         return self.clip_cache[path]
+
+    def audio_for(self, reference: str) -> AudioClip:
+        path = self.resolve_path(reference)
+
+        if path not in self.audio_cache:
+            self.audio_cache[path] = probe_audio(path)
+
+        return self.audio_cache[path]
 
     def make_trimmed_clip(self, reference: str, times: list[str]) -> TrimmedClip:
         clip = self.clip_for(reference)
@@ -93,6 +160,19 @@ class RecipeBuilder:
             return TrimmedClip(clip, start, end)
 
         return TrimmedClip(clip)
+
+    def make_trimmed_audio(self, reference: str, times: list[str]) -> TrimmedAudio:
+        clip = self.audio_for(reference)
+
+        if times:
+            start, end = parse_time(times[0]), parse_time(times[1])
+
+            if start >= end or end > clip.duration:
+                raise ValueError(f"trim must satisfy 0 <= START < END <= {clip.duration} seconds")
+
+            return TrimmedAudio(clip, start, end)
+
+        return TrimmedAudio(clip)
 
     def save(self, arguments: list[str], _section: Section, stack: tuple[str, ...]) -> None:
         if stack:
@@ -116,18 +196,43 @@ class RecipeBuilder:
             raise ValueError("save filename must end in .mp4")
 
     def add(self, arguments: list[str], section: Section, stack: tuple[str, ...]) -> None:
-        if len(arguments) == 1 and arguments[0] in self.sections:
+        if len(arguments) in (1, 3) and arguments[0] in self.sections:
             name = arguments[0]
+            kind, commands = self.sections[name]
 
             if name in stack:
                 raise ValueError(f"recursive section reference: {' -> '.join((*stack, name))}")
 
-            child = self.build_section(self.sections[name], (*stack, name))
+            if kind == "audio":
+                start = Decimal(0)
+                end = None
+
+                if len(arguments) == 3:
+                    start, end = parse_time(arguments[1]), parse_time(arguments[2])
+
+                    if start >= end:
+                        raise ValueError("audio placement must satisfy START < END")
+
+                audio = self.build_audio_section(commands, (*stack, name))
+                section.overlays.append(AudioOverlay(audio, start, end))
+                return
+
+            child = self.build_section(commands, (*stack, name))
 
             if not child.clips:
                 raise ValueError(f"section {name!r} contains no clips")
 
-            section.clips.append(child)
+            if len(arguments) == 3:
+                start, end = parse_time(arguments[1]), parse_time(arguments[2])
+
+                if start >= end or end > child.duration:
+                    raise ValueError(
+                        f"trim must satisfy 0 <= START < END <= {child.duration} seconds"
+                    )
+
+                section.clips.append(TrimmedSection(child, start, end))
+            else:
+                section.clips.append(child)
         elif len(arguments) in (1, 3):
             reference, *times = arguments
 
@@ -136,21 +241,49 @@ class RecipeBuilder:
 
             section.clips.append(self.make_trimmed_clip(reference, times))
         else:
-            raise ValueError("expected 'add PATH [START END]' or 'add SECTION'")
+            raise ValueError("expected 'add PATH [START END]' or 'add SECTION [START END]'")
 
-    def speed(self, arguments: list[str], section: Section, _stack: tuple[str, ...]) -> None:
+    def add_audio(
+        self, arguments: list[str], section: AudioSection, stack: tuple[str, ...]
+    ) -> None:
+        if len(arguments) == 1 and arguments[0] in self.sections:
+            name = arguments[0]
+            kind, commands = self.sections[name]
+
+            if kind != "audio":
+                raise ValueError(f"video section {name!r} cannot be added to audio")
+
+            if name in stack:
+                raise ValueError(f"recursive section reference: {' -> '.join((*stack, name))}")
+
+            section.clips.append(self.build_audio_section(commands, (*stack, name)))
+        elif len(arguments) in (1, 3):
+            reference, *times = arguments
+
+            if reference in self.sections:
+                raise ValueError("a section cannot be trimmed; trim clips inside it")
+
+            section.clips.append(self.make_trimmed_audio(reference, times))
+        else:
+            raise ValueError("expected 'add PATH [START END]' or 'add AUDIO_SECTION'")
+
+    def speed(
+        self, arguments: list[str], section: EditableSection, _stack: tuple[str, ...]
+    ) -> None:
         if len(arguments) != 1:
             raise ValueError("expected 'speed VALUE'")
 
         section.speed = parse_factor(arguments[0], "speed")
 
-    def volume(self, arguments: list[str], section: Section, _stack: tuple[str, ...]) -> None:
+    def volume(
+        self, arguments: list[str], section: EditableSection, _stack: tuple[str, ...]
+    ) -> None:
         if len(arguments) != 1:
             raise ValueError("expected 'volume VALUE'")
 
         section.volume = parse_factor(arguments[0], "volume")
 
-    def mute(self, arguments: list[str], section: Section, _stack: tuple[str, ...]) -> None:
+    def mute(self, arguments: list[str], section: EditableSection, _stack: tuple[str, ...]) -> None:
         if arguments:
             raise ValueError("expected 'mute'")
 
@@ -165,7 +298,7 @@ class RecipeBuilder:
 
         section.compression_target = parse_size(arguments[0])
 
-    def trim(self, arguments: list[str], section: Section, _stack: tuple[str, ...]) -> None:
+    def trim(self, arguments: list[str], section: EditableSection, _stack: tuple[str, ...]) -> None:
         if len(arguments) != 2 or arguments[0] not in ("left", "right"):
             raise ValueError("expected 'trim left|right DURATION', such as 'trim right 1m'")
 
