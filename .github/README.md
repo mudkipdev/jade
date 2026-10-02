@@ -1,5 +1,5 @@
 # jade
-An interactive CLI video editor.
+An interactive CLI video editor inspired by `git rebase -i`.
 
 ## Requirements
 - ffmpeg
